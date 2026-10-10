@@ -756,24 +756,55 @@ impl ChoiceJailState {
             return;
         }
 
-        if let MatchResult::Partial {
-            prefix, partial, ..
-        } = jail_stream.marker_matcher.process_chunk(content, "")
-        {
-            if !prefix.is_empty() {
-                #[allow(deprecated)]
-                let trailing_choice = create_choice_stream(
-                    choice.index,
-                    choice.delta.role,
-                    &prefix,
-                    None,
-                    None,
-                    choice.logprobs.clone(),
-                );
-                emissions.push(ChoiceEmission::Trailing(trailing_choice));
+        match jail_stream.marker_matcher.process_chunk(content, "") {
+            // The trailing bytes after a completed call contain another COMPLETE
+            // tool-call start marker (a burst delta straddling `<end><start>`).
+            // Emit any genuine pre-marker text, then re-jail from the marker so
+            // the next call is parsed instead of its markup leaking into
+            // `content`. Without this, a family whose partial-suffix split reads
+            // the text after the marker as a marker prefix (e.g. gemma4 reading
+            // `ca` as a prefix of `call:`) emits the complete start marker as
+            // trailing content.
+            MatchResult::Complete {
+                prefix,
+                marker,
+                suffix,
+                ..
+            } => {
+                if !prefix.is_empty() {
+                    #[allow(deprecated)]
+                    let trailing_choice = create_choice_stream(
+                        choice.index,
+                        choice.delta.role,
+                        &prefix,
+                        None,
+                        None,
+                        choice.logprobs.clone(),
+                    );
+                    emissions.push(ChoiceEmission::Trailing(trailing_choice));
+                }
+                self.begin_jail(format!("{marker}{suffix}"), None);
+                return;
             }
-            self.partial_match_buffer = partial;
-            return;
+            MatchResult::Partial {
+                prefix, partial, ..
+            } => {
+                if !prefix.is_empty() {
+                    #[allow(deprecated)]
+                    let trailing_choice = create_choice_stream(
+                        choice.index,
+                        choice.delta.role,
+                        &prefix,
+                        None,
+                        None,
+                        choice.logprobs.clone(),
+                    );
+                    emissions.push(ChoiceEmission::Trailing(trailing_choice));
+                }
+                self.partial_match_buffer = partial;
+                return;
+            }
+            MatchResult::None { .. } => {}
         }
 
         if let Some((prefix, partial)) = jail_stream.split_partial_tool_call_start(content) {
@@ -3299,6 +3330,45 @@ mod tests {
         choice.delta.content = None;
         choice.finish_reason = Some(FinishReason::Stop);
         chunk
+    }
+
+    /// Regression: a burst delta that straddles one call's end marker and the
+    /// next call's start marker must re-jail the trailing start, not leak the
+    /// `<|tool_call>` marker into `content`. (Speculative decoding produces such
+    /// multi-token deltas.) Before the fix, gemma4's partial-suffix split read
+    /// the `ca` after the marker as a prefix of `call:` and emitted the complete
+    /// `<|tool_call>` start as trailing content.
+    #[tokio::test]
+    async fn gemma4_trailing_start_marker_after_end_is_rejailed_not_leaked() {
+        let chunks = vec![
+            text_chunk("<|tool_call>call"),
+            text_chunk(":f{"),
+            text_chunk("a:<|\"|>1<|\"|>"),
+            text_chunk("}<tool_call|><|tool_call>ca"), // end of f + start of g
+            text_chunk("ll:g{"),
+            text_chunk("b:"),
+            text_chunk("<|\"|>2<|\"|>}<tool_call|>"),
+            terminal_chunk(),
+        ];
+        let responses: Vec<_> = apply_tool_calling_jail(
+            Some("gemma4".to_string()),
+            Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::Auto),
+            None,
+            false,
+            stream::iter(chunks),
+        )
+        .collect()
+        .await;
+        let content = collect_text_content(&responses);
+        assert!(
+            !content.contains("<|tool_call>") && !content.contains("<tool_call|>"),
+            "tool-call markup leaked into content: {content:?}"
+        );
+        let calls: Vec<String> = collect_tool_calls(&responses)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(calls, vec!["f".to_string(), "g".to_string()]);
     }
 
     async fn apply_kimi_k3(
