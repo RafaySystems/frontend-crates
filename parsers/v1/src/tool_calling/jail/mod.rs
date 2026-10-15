@@ -608,24 +608,60 @@ impl ChoiceJailState {
             return;
         }
 
-        if let MatchResult::Partial {
-            prefix, partial, ..
-        } = jail_stream.marker_matcher.process_chunk(content, "")
-        {
-            if !prefix.is_empty() {
-                #[allow(deprecated)]
-                let trailing_choice = create_choice_stream(
-                    choice.index,
-                    choice.delta.role,
-                    &prefix,
-                    None,
-                    None,
-                    choice.logprobs.clone(),
-                );
-                emissions.push(ChoiceEmission::Trailing(trailing_choice));
+        match jail_stream.marker_matcher.process_chunk(content, "") {
+            // The chunk that closed one call can already carry the full start
+            // marker of the next (parallel calls with multi-token deltas). Re-jail
+            // from that marker, the same way `process_content` does; otherwise the
+            // gemma4 call-prefix split below emits the marker as content and the
+            // next call is lost. Port of ai-dynamo/frontend-crates#408 onto 7.0.1.
+            MatchResult::Complete {
+                prefix,
+                marker,
+                suffix,
+                ..
+            } => {
+                let prefix_has_harmony_protocol =
+                    is_harmony_parser(jail_stream.tool_call_parser.as_deref())
+                        && contains_harmony_protocol(&prefix);
+                let jailed = if prefix_has_harmony_protocol {
+                    format!("{}{}{}", prefix, marker, suffix)
+                } else {
+                    if !prefix.is_empty() {
+                        #[allow(deprecated)]
+                        let trailing_choice = create_choice_stream(
+                            choice.index,
+                            choice.delta.role,
+                            &prefix,
+                            None,
+                            None,
+                            choice.logprobs.clone(),
+                        );
+                        emissions.push(ChoiceEmission::Trailing(trailing_choice));
+                    }
+                    format!("{}{}", marker, suffix)
+                };
+                self.begin_jail(jailed, choice.logprobs.clone());
+                return;
             }
-            self.partial_match_buffer = partial;
-            return;
+            MatchResult::Partial {
+                prefix, partial, ..
+            } => {
+                if !prefix.is_empty() {
+                    #[allow(deprecated)]
+                    let trailing_choice = create_choice_stream(
+                        choice.index,
+                        choice.delta.role,
+                        &prefix,
+                        None,
+                        None,
+                        choice.logprobs.clone(),
+                    );
+                    emissions.push(ChoiceEmission::Trailing(trailing_choice));
+                }
+                self.partial_match_buffer = partial;
+                return;
+            }
+            MatchResult::None { .. } => {}
         }
 
         if let Some((prefix, partial)) = jail_stream.split_partial_tool_call_start(content) {
